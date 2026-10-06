@@ -1,0 +1,166 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU pipeline lag repro</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #111; color: #ddd; font: 14px sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  #ring { position: fixed; left: 0; top: 0; width: 80px; height: 80px; box-sizing: border-box; border: 3px solid #f33; pointer-events: none; }
+  #info { position: fixed; left: 8px; top: 8px; background: #000c; padding: 6px 10px; pointer-events: none; line-height: 1.5; }
+</style>
+<canvas></canvas>
+<div id="ring"></div>
+<div id="info">
+  Green = WebGPU (compute raster → rgba16f → composite), red = DOM. Same position each frame.<br>
+  Per frame: <span id="passes"></span> compute passes (some indirect) + readbacks + 1 composite pass, 1 submit.<br>
+  <b>+/-</b> elements ×2/÷2 · <b>]/[</b> work per element ×2/÷2 · <b>M</b> toggle auto-motion / on-demand mouse<br>
+  elements: <span id="n"></span> · work: <span id="w"></span> · mode: <span id="mode"></span> · GPU frame: <span id="gpu">-</span> ms<br>
+  <span id="err" style="color:#f66"></span>
+</div>
+<script>addEventListener('error', e => document.getElementById('err').textContent = 'JS error: ' + e.message); addEventListener('unhandledrejection', e => document.getElementById('err').textContent = 'Error: ' + e.reason);</script>
+<script type="module">
+const q = new URLSearchParams(location.search);
+let N = +q.get('n') || 1 << 20;      // "splat" count
+let WORK = +q.get('work') || 8;      // loop iterations per element per pass
+let mode = q.get('mode') || 'auto';
+const PASSES = 16;                   // like projector + binning + sort stages
+const MAX_N = 1 << 24;
+
+const canvas = document.querySelector('canvas'), ring = document.getElementById('ring');
+const $ = (id, t) => document.getElementById(id).textContent = t;
+const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+const device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: MAX_N * 4, maxBufferSize: MAX_N * 4 } });
+device.onuncapturederror = e => { $('err', 'GPU error: ' + e.error.message); console.error(e.error.message); };
+const ctx = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+// same as wgpu get_default_config + view_formats = [non-sRGB format]
+ctx.configure({ device, format, viewFormats: [format], alphaMode: 'opaque', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+
+const U = GPUBufferUsage;
+const uni = device.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST });          // camera-like uniform
+const data = device.createBuffer({ size: MAX_N * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+const counters = device.createBuffer({ size: 256, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+const indirect = device.createBuffer({ size: 256, usage: U.STORAGE | U.INDIRECT | U.COPY_DST });
+const capStage = device.createBuffer({ size: 32, usage: U.MAP_READ | U.COPY_DST });   // per-frame capacity readback
+const visStage = device.createBuffer({ size: 4, usage: U.MAP_READ | U.COPY_DST });    // every-30th-frame readback
+
+const compute = device.createShaderModule({ code: `
+  struct Uni { pos: vec2f, half: f32, n: u32, work: u32, frame: u32 };
+  @group(0) @binding(0) var<uniform> u: Uni;
+  @group(0) @binding(1) var<storage, read_write> data: array<u32>;
+  @group(0) @binding(2) var<storage, read_write> counters: array<atomic<u32>>;
+  @group(0) @binding(3) var<storage, read_write> args: array<u32>;
+  @compute @workgroup_size(1) fn prep() {   // writes indirect dispatch args, like dispatch_prep
+    let wg = (u.n + 255u) / 256u;
+    args[0] = min(wg, 65535u); args[1] = max(1u, (wg + 65534u) / 65535u); args[2] = 1u;
+    atomicStore(&counters[0], 0u);
+  }
+  @compute @workgroup_size(256) fn stage(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nw: vec3u) {
+    let i = g.x + g.y * nw.x * 256u;
+    if (i >= u.n) { return; }
+    var h = data[i] ^ (i * 747796405u + u.frame);
+    for (var k = 0u; k < u.work; k++) { h = h * 1664525u + 1013904223u; h ^= h >> 13u; }
+    data[i] = h;
+    if ((h & 1023u) == 0u) { atomicAdd(&counters[0], 1u); }
+  }` });
+const raster = device.createShaderModule({ code: `
+  struct Uni { pos: vec2f, half: f32, n: u32, work: u32, frame: u32 };
+  @group(0) @binding(0) var<uniform> u: Uni;
+  @group(0) @binding(1) var<storage, read> data: array<u32>;
+  @group(0) @binding(2) var out: texture_storage_2d<rgba16float, write>;
+  @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3u) {
+    let size = textureDimensions(out);
+    if (g.x >= size.x || g.y >= size.y) { return; }
+    let p = vec2f(g.xy) + 0.5;
+    let dep = f32(data[(g.x + g.y * size.x) % u.n] & 1u) * 1e-6; // depend on the compute chain
+    let inside = max(abs(p.x - u.pos.x), abs(p.y - u.pos.y)) < u.half;
+    textureStore(out, g.xy, select(vec4f(0.07, 0.07, 0.09, 1), vec4f(0.1, 0.9, 0.3, 1), inside) + dep);
+  }` });
+const composite = device.createShaderModule({ code: `
+  @group(0) @binding(0) var tex: texture_2d<f32>;
+  @group(0) @binding(1) var smp: sampler;
+  struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+    var p = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+    return V(vec4f(p[i], 0, 1), vec2f(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5));
+  }
+  @fragment fn fs(v: V) -> @location(0) vec4f { return textureSample(tex, smp, v.uv); }` });
+
+const prep = device.createComputePipeline({ layout: 'auto', compute: { module: compute, entryPoint: 'prep' } });
+const stage = device.createComputePipeline({ layout: 'auto', compute: { module: compute, entryPoint: 'stage' } });
+const rasterP = device.createComputePipeline({ layout: 'auto', compute: { module: raster } });
+const compP = device.createRenderPipeline({ layout: 'auto', vertex: { module: composite }, fragment: { module: composite, targets: [{ format }] } });
+const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+const drawArgs = device.createBuffer({ size: 16, usage: U.INDIRECT | U.COPY_DST });
+device.queue.writeBuffer(drawArgs, 0, new Uint32Array([3, 1, 0, 0]));
+
+const bg = (p, entries) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: entries.map((resource, binding) => ({ binding, resource })).filter(e => e.resource) });
+const prepBG = bg(prep, [{ buffer: uni }, null, { buffer: counters }, { buffer: indirect }]);
+const stageBG = bg(stage, [{ buffer: uni }, { buffer: data }, { buffer: counters }]);
+let tex, rasterBG, compBG;
+function resize() {
+  const w = Math.round(innerWidth * devicePixelRatio), h = Math.round(innerHeight * devicePixelRatio);
+  if (canvas.width === w && canvas.height === h && tex) return;
+  canvas.width = w; canvas.height = h;
+  tex?.destroy();
+  tex = device.createTexture({ size: [w, h], format: 'rgba16float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  rasterBG = bg(rasterP, [{ buffer: uni }, { buffer: data }, tex.createView()]);
+  compBG = bg(compP, [tex.createView(), sampler]);
+}
+
+let frame = 0, capPending = false, capCopied = false, visPending = false, mouse = null;
+addEventListener('pointermove', e => { mouse = { x: e.clientX, y: e.clientY }; if (mode === 'mouse') requestAnimationFrame(render); });
+addEventListener('keydown', e => {
+  if (e.key === '+' || e.key === '=') N = Math.min(MAX_N, N * 2);
+  if (e.key === '-') N = Math.max(256, N / 2);
+  if (e.key === ']') WORK *= 2;
+  if (e.key === '[') WORK = Math.max(1, WORK / 2);
+  if (e.key.toLowerCase() === 'm') { mode = mode === 'auto' ? 'mouse' : 'auto'; if (mode === 'auto') requestAnimationFrame(loop); }
+});
+
+function render(t = performance.now()) {
+  resize();
+  const dpr = devicePixelRatio;
+  const p = mode === 'auto' || !mouse
+    ? { x: innerWidth / 2 + Math.cos(t / 250) * innerWidth * 0.3, y: innerHeight / 2 + Math.sin(t / 250) * innerHeight * 0.3 }
+    : mouse;
+  ring.style.transform = `translate(${p.x - 40}px, ${p.y - 40}px)`;
+
+  // capacity readback: map the copy recorded last frame, before this frame's submit
+  if (capCopied && !capPending) { capPending = true; capCopied = false; capStage.mapAsync(GPUMapMode.READ).then(() => { capStage.unmap(); capPending = false; }); }
+
+  const ub = new ArrayBuffer(32), f = new Float32Array(ub), ui = new Uint32Array(ub);
+  f[0] = p.x * dpr; f[1] = p.y * dpr; f[2] = 40 * dpr; ui[3] = N; ui[4] = WORK; ui[5] = frame;
+  device.queue.writeBuffer(uni, 0, ub);
+
+  const enc = device.createCommandEncoder();
+  enc.clearBuffer(counters); enc.clearBuffer(indirect, 0, 16);
+  for (let s = 0; s < PASSES; s++) {          // one compute pass per stage, alternating prep / indirect work
+    let pass = enc.beginComputePass();
+    pass.setPipeline(prep); pass.setBindGroup(0, prepBG); pass.dispatchWorkgroups(1); pass.end();
+    pass = enc.beginComputePass();
+    pass.setPipeline(stage); pass.setBindGroup(0, stageBG); pass.dispatchWorkgroupsIndirect(indirect, 0); pass.end();
+  }
+  if (!capPending && !capCopied) { for (let k = 0; k < 8; k++) enc.copyBufferToBuffer(counters, 0, capStage, k * 4, 4); capCopied = true; }
+  const doVis = frame % 30 === 0 && !visPending;
+  if (doVis) enc.copyBufferToBuffer(counters, 0, visStage, 0, 4);
+
+  const rp = enc.beginComputePass();
+  rp.setPipeline(rasterP); rp.setBindGroup(0, rasterBG); rp.dispatchWorkgroups(Math.ceil(canvas.width / 8), Math.ceil(canvas.height / 8)); rp.end();
+
+  const view = ctx.getCurrentTexture().createView({ format });
+  const cp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', clearValue: [0, 0, 0, 1], storeOp: 'store' }] });
+  cp.setPipeline(compP); cp.setBindGroup(0, compBG); cp.drawIndirect(drawArgs, 0); cp.end();
+
+  const t0 = performance.now();
+  device.queue.submit([enc.finish()]);
+  device.queue.onSubmittedWorkDone().then(() => $('gpu', (performance.now() - t0).toFixed(1)));
+  // visible-count readback: mapped after submit, every 30th frame
+  if (doVis) { visPending = true; visStage.mapAsync(GPUMapMode.READ).then(() => { visStage.unmap(); visPending = false; }); }
+
+  frame++;
+  $('passes', PASSES * 2 + 1); $('n', N); $('w', WORK); $('mode', mode === 'auto' ? 'auto-motion' : 'on-demand mouse');
+}
+function loop(t) { if (mode !== 'auto') return; render(t); requestAnimationFrame(loop); }
+if (mode === 'auto') requestAnimationFrame(loop); else render();
+</script>

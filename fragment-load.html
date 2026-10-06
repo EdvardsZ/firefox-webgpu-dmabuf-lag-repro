@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU canvas lag repro</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #111; color: #ddd; font: 14px sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  #ring { position: fixed; left: 0; top: 0; width: 80px; height: 80px; box-sizing: border-box; border: 3px solid #f33; }
+  #info { position: fixed; left: 8px; top: 8px; background: #000c; padding: 6px 10px; }
+</style>
+<canvas></canvas>
+<div id="ring"></div>
+<div id="info">Green = WebGPU, red = DOM, same position each frame. +/- changes GPU load.<br>
+iters: <span id="iters"></span> · GPU frame: <span id="gpu">-</span> ms</div>
+<script type="module">
+let iters = +new URLSearchParams(location.search).get('iters') || 256;
+const canvas = document.querySelector('canvas'), ring = document.getElementById('ring');
+const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+const ctx = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+ctx.configure({ device, format });
+
+const module = device.createShaderModule({ code: `
+  @group(0) @binding(0) var<uniform> u: vec4f; // pos.xy, half, iters
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    var p = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+    return vec4f(p[i], 0, 1);
+  }
+  @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    var acc = 0.0; // busy-work to make the frame GPU-bound
+    for (var i = 0u; i < u32(u.w); i++) { acc = fract(acc + sin(fc.x + f32(i))); }
+    let inside = max(abs(fc.x - u.x), abs(fc.y - u.y)) < u.z;
+    return select(vec4f(0.07, 0.07, 0.09, 1), vec4f(0.1, 0.9, 0.3, 1), inside) + acc * 1e-9;
+  }` });
+const pipeline = device.createRenderPipeline({ layout: 'auto',
+  vertex: { module }, fragment: { module, targets: [{ format }] } });
+const ubuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubuf } }] });
+
+addEventListener('keydown', e => { if (e.key === '+' || e.key === '=') iters *= 2; if (e.key === '-') iters = Math.max(1, iters / 2); });
+
+function frame(t) {
+  const dpr = devicePixelRatio;
+  canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr;
+  const x = innerWidth / 2 + Math.cos(t / 250) * innerWidth * 0.3;
+  const y = innerHeight / 2 + Math.sin(t / 250) * innerHeight * 0.3;
+  ring.style.transform = `translate(${x - 40}px, ${y - 40}px)`;
+  device.queue.writeBuffer(ubuf, 0, new Float32Array([x * dpr, y * dpr, 40 * dpr, iters]));
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
+  pass.setPipeline(pipeline); pass.setBindGroup(0, bind); pass.draw(3); pass.end();
+  const t0 = performance.now();
+  device.queue.submit([enc.finish()]);
+  device.queue.onSubmittedWorkDone().then(() => document.getElementById('gpu').textContent = (performance.now() - t0).toFixed(1));
+  document.getElementById('iters').textContent = iters;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
